@@ -10,8 +10,10 @@ to compute clutter loss for satellite link budget calculations.
 
 from __future__ import annotations
 
+import collections
 import json
 import math
+import os
 import platform
 import threading
 import time
@@ -37,8 +39,47 @@ try:
 except ImportError:
     HAS_RASTERIO = False
 
-# Module-level cache for clutter loss values
-_CLUTTER_CACHE: dict[tuple[int, int], float] = {}
+# ---------------------------------------------------------------------------
+# Bounded LRU clutter cache
+# Stays between CLUTTER_CACHE_MIN_SIZE and CLUTTER_CACHE_MAX_SIZE entries.
+# A background daemon thread evicts the oldest (LRU) entries whenever the
+# cache exceeds the max, trimming it back down to the min.
+# Configurable via environment variables.
+# ---------------------------------------------------------------------------
+_CACHE_MIN_SIZE: int = int(os.environ.get("CLUTTER_CACHE_MIN_SIZE", "5000"))
+_CACHE_MAX_SIZE: int = int(os.environ.get("CLUTTER_CACHE_MAX_SIZE", "20000"))
+_CACHE_EVICT_INTERVAL: float = float(
+    os.environ.get("CLUTTER_CACHE_EVICT_INTERVAL", "60")
+)
+
+# OrderedDict gives O(1) LRU via move_to_end / popitem(last=False)
+_CLUTTER_CACHE: collections.OrderedDict[tuple[int, int], float] = (
+    collections.OrderedDict()
+)
+_CLUTTER_CACHE_LOCK = threading.Lock()
+
+
+def _evict_clutter_cache() -> int:
+    """Evict oldest entries until cache is at min size. Returns number evicted."""
+    evicted = 0
+    with _CLUTTER_CACHE_LOCK:
+        while len(_CLUTTER_CACHE) > _CACHE_MIN_SIZE:
+            _CLUTTER_CACHE.popitem(last=False)
+            evicted += 1
+    return evicted
+
+
+def _clutter_cache_eviction_loop() -> None:
+    """Background daemon: evict stale entries when cache exceeds max size."""
+    while True:
+        time.sleep(_CACHE_EVICT_INTERVAL)
+        if len(_CLUTTER_CACHE) > _CACHE_MAX_SIZE:
+            _evict_clutter_cache()
+
+
+threading.Thread(
+    target=_clutter_cache_eviction_loop, daemon=True, name="clutter-cache-evictor"
+).start()
 
 # Tile dataset cache: {tile_name: (dataset, transformer, timestamp)}
 # Keeps rasterio file handles open for 10 minutes to avoid repeated file I/O
@@ -58,7 +99,8 @@ _ACTIVE_BBOX: tuple[float, float, float, float] | None = None
 
 def clear_clutter_cache() -> None:
     """Clear the clutter loss cache."""
-    _CLUTTER_CACHE.clear()
+    with _CLUTTER_CACHE_LOCK:
+        _CLUTTER_CACHE.clear()
 
 
 def clear_tile_cache() -> None:
@@ -434,8 +476,11 @@ def clutter_loss_db(
         Clutter loss in dB
     """
     key = (int(round(lat * 1000)), int(round(lon * 1000)))
-    if key in _CLUTTER_CACHE:
-        return _CLUTTER_CACHE[key]
+
+    with _CLUTTER_CACHE_LOCK:
+        if key in _CLUTTER_CACHE:
+            _CLUTTER_CACHE.move_to_end(key)  # mark as recently used
+            return _CLUTTER_CACHE[key]
 
     table = loss_table if loss_table is not None else CLUTTER_LOSS_DB
     fb = fallback_db if fallback_db is not None else CLUTTER_FALLBACK_DB
@@ -447,14 +492,19 @@ def clutter_loss_db(
     cl = fetch_worldcover_class(lat, lon, worldcover_dir)
     if cl is None:
         val = fb
+    else:
+        if verbose and (point_num == 0 or point_num % 50 == 0):
+            print(f"[Clutter] WorldCover class at lat={lat:.2f}, lon={lon:.2f} is {cl}")
+        val = table.get(cl, fb)
+
+    with _CLUTTER_CACHE_LOCK:
         _CLUTTER_CACHE[key] = val
-        return val
+        _CLUTTER_CACHE.move_to_end(key)
+        # Inline eviction: if we just crossed the max, trim to min immediately
+        if len(_CLUTTER_CACHE) > _CACHE_MAX_SIZE:
+            while len(_CLUTTER_CACHE) > _CACHE_MIN_SIZE:
+                _CLUTTER_CACHE.popitem(last=False)
 
-    if verbose and (point_num == 0 or point_num % 50 == 0):
-        print(f"[Clutter] WorldCover class at lat={lat:.2f}, lon={lon:.2f} is {cl}")
-
-    val = table.get(cl, fb)
-    _CLUTTER_CACHE[key] = val
     return val
 
 
