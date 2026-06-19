@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import collections
 import json
+import logging
 import math
 import os
 import platform
@@ -38,6 +39,8 @@ try:
     HAS_RASTERIO = True
 except ImportError:
     HAS_RASTERIO = False
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Bounded LRU clutter cache
@@ -95,6 +98,11 @@ _CACHE_TTL_SECONDS = 600  # 10 minutes
 # Thread synchronization for tile cache access
 _TILE_CACHE_LOCK = threading.Lock()
 _TILE_REFS: dict[str, int] = {}  # Reference count per tile
+
+# Per-tile download locks: prevents two threads from downloading the same tile
+# simultaneously. Lock is acquired for the duration of the download only.
+_TILE_DOWNLOAD_LOCKS: dict[str, threading.Lock] = {}
+_TILE_DOWNLOAD_LOCKS_LOCK = threading.Lock()
 
 # Active bounding box for tile filtering optimization
 # Format: (min_lon, min_lat, max_lon, max_lat) or None
@@ -330,14 +338,15 @@ def ensure_worldcover_tile(
     """
     Ensure ESA WorldCover 3x3 degree tile exists locally.
 
-    Downloads the tile from S3 if not present. If an active bounding box is set,
-    tiles outside the bbox are skipped to optimize download.
+    Downloads the tile from S3 if not present. Per-tile locking prevents
+    concurrent threads from downloading the same tile simultaneously.
+    If an active bounding box is set, tiles outside the bbox are skipped.
 
     Args:
         lat: Latitude in degrees
         lon: Longitude in degrees
         worldcover_dir: Directory for storing WorldCover tiles
-        timeout_sec: Download timeout in seconds
+        timeout_sec: Total download timeout in seconds (default 300)
 
     Returns:
         Path to the local tile file, or None if tile is outside active bbox
@@ -345,14 +354,12 @@ def ensure_worldcover_tile(
     Raises:
         RuntimeError: If download fails or times out
     """
-    # Calculate tile coordinates (southwest corner)
     tile_lat = int(math.floor(lat / 3.0) * 3)
     tile_lon = int(math.floor(lon / 3.0) * 3)
 
-    # Check if tile is within active bounding box (optimization)
     if _ACTIVE_BBOX is not None:
         if not tile_overlaps_bbox(tile_lat, tile_lon, _ACTIVE_BBOX):
-            return None  # Skip this tile
+            return None
 
     tile_name = get_tile_name(lat, lon)
     tile_path = worldcover_dir / tile_name
@@ -360,44 +367,67 @@ def ensure_worldcover_tile(
     if tile_path.exists() and tile_path.stat().st_size > 0:
         return tile_path
 
-    import requests
+    # Per-tile lock: only one thread downloads a given tile at a time.
+    # Other threads block here and find the file ready when the lock is released.
+    with _TILE_DOWNLOAD_LOCKS_LOCK:
+        if tile_name not in _TILE_DOWNLOAD_LOCKS:
+            _TILE_DOWNLOAD_LOCKS[tile_name] = threading.Lock()
+        tile_lock = _TILE_DOWNLOAD_LOCKS[tile_name]
 
-    url = f"{WORLDCOVER_S3_BASE}/{tile_name}"
-    tmp_path = tile_path.with_suffix(".part")
-    start_time = time.time()
+    with tile_lock:
+        # Re-check after acquiring lock — another thread may have downloaded it
+        if tile_path.exists() and tile_path.stat().st_size > 0:
+            return tile_path
 
-    print(f"[WorldCover] Downloading {tile_name} from S3...")
-    try:
-        with requests.get(url, stream=True, timeout=30) as r:
-            if r.status_code == 404:
-                raise RuntimeError(
-                    f"WorldCover tile not found (HTTP 404) for {tile_name}"
-                )
-            if r.status_code != 200:
-                raise RuntimeError(
-                    f"WorldCover download failed (HTTP {r.status_code}) for {tile_name}"
-                )
-            total = int(r.headers.get("Content-Length", 0))
-            downloaded = 0
-            tile_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(tmp_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        if time.time() - start_time > timeout_sec:
-                            raise RuntimeError(
-                                f"Download timed out after {timeout_sec}s"
-                            )
-            if total and downloaded < total:
-                raise RuntimeError(f"Incomplete download ({downloaded}/{total} bytes)")
-        tmp_path.replace(tile_path)
-        print(f"[WorldCover] Download complete: {tile_name}")
-        return tile_path
-    except Exception as exc:
-        if tmp_path.exists():
+        import requests
+
+        url = f"{WORLDCOVER_S3_BASE}/{tile_name}"
+        tmp_path = tile_path.with_suffix(".part")
+
+        # Create directory before opening the temp file
+        worldcover_dir.mkdir(parents=True, exist_ok=True)
+
+        logger.info("Downloading WorldCover tile %s from S3...", tile_name)
+        start_time = time.time()
+        try:
+            # connect_timeout=30, read_timeout=60 per chunk
+            with requests.get(url, stream=True, timeout=(30, 60)) as r:
+                if r.status_code == 404:
+                    raise RuntimeError(
+                        f"WorldCover tile not found on S3 (HTTP 404): {tile_name}"
+                    )
+                if r.status_code != 200:
+                    raise RuntimeError(
+                        f"WorldCover download failed (HTTP {r.status_code}): {tile_name}"
+                    )
+                total = int(r.headers.get("Content-Length", 0))
+                downloaded = 0
+                with open(tmp_path, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            if time.time() - start_time > timeout_sec:
+                                raise RuntimeError(
+                                    f"Download timed out after {timeout_sec}s "
+                                    f"({downloaded} bytes received)"
+                                )
+                if total and downloaded < total:
+                    raise RuntimeError(
+                        f"Incomplete download: got {downloaded}/{total} bytes"
+                    )
+            tmp_path.replace(tile_path)
+            elapsed = time.time() - start_time
+            logger.info(
+                "WorldCover tile %s downloaded in %.1fs (%d bytes)",
+                tile_name,
+                elapsed,
+                downloaded,
+            )
+            return tile_path
+        except Exception as exc:
             tmp_path.unlink(missing_ok=True)
-        raise RuntimeError(f"Failed to download {tile_name}: {exc}") from exc
+            raise RuntimeError(f"Failed to download {tile_name}: {exc}") from exc
 
 
 def fetch_worldcover_class(
@@ -435,9 +465,19 @@ def fetch_worldcover_class(
         if not download_if_missing:
             return None
         try:
-            tile_path = ensure_worldcover_tile(lat, lon, worldcover_dir)
-        except Exception:
+            result = ensure_worldcover_tile(lat, lon, worldcover_dir)
+        except Exception as exc:
+            logger.warning(
+                "WorldCover tile download failed for (%.4f, %.4f): %s — using fallback",
+                lat,
+                lon,
+                exc,
+            )
             return None
+        if result is None:
+            # Tile skipped (outside active bbox)
+            return None
+        tile_path = result
 
     try:
         # Use context manager for thread-safe tile access with reference counting
