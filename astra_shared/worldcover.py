@@ -404,7 +404,7 @@ def fetch_worldcover_class(
     lat: float,
     lon: float,
     worldcover_dir: Path | None = None,
-    download_if_missing: bool = False,
+    download_if_missing: bool = True,
 ) -> int | None:
     """
     Fetch ESA WorldCover land cover class from local tile.
