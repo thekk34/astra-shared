@@ -17,6 +17,7 @@ from .defaults import (
     POLARIZATION_LOSS_DB_MIN,
     VALID_CLUTTER_CLASS_IDS,
 )
+from .custom_antenna_schema import normalize_custom_antenna
 
 logger = logging.getLogger(__name__)
 
@@ -143,10 +144,32 @@ def _parse_eirp(params: dict) -> float:
     if "eirp_dbw" in params:
         return _get_float(params, "eirp_dbw", DEFAULT_EIRP_DBW)
     if "tx_power" in params and "tx_gain" in params:
-        return _get_float(params, "tx_power", 40.0) + _get_float(params, "tx_gain", 30.0)
+        return _get_float(params, "tx_power", 40.0) + _get_float(
+            params, "tx_gain", 30.0
+        )
     if "tx_power_dbw" in params and "tx_gain_dbi" in params:
-        return _get_float(params, "tx_power_dbw", 40.0) + _get_float(params, "tx_gain_dbi", 30.0)
+        return _get_float(params, "tx_power_dbw", 40.0) + _get_float(
+            params, "tx_gain_dbi", 30.0
+        )
     return DEFAULT_EIRP_DBW
+
+
+def _parse_custom_antenna_payload(params: dict) -> dict:
+    raw = params.get("custom_antenna")
+    if raw is None or raw == "" or raw == "null":
+        return normalize_custom_antenna(None)
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            return normalize_custom_antenna(None)
+    return normalize_custom_antenna(raw)
+
+
+def _normalize_antenna_model(value: str | None) -> str:
+    model = str(value or "gaussian").strip().lower()
+    allowed = {"gaussian", "bessel", "itu_s672", "phased_array", "custom"}
+    return model if model in allowed else "gaussian"
 
 
 # =============================================================================
@@ -205,31 +228,56 @@ def parse_rf_params(params: dict) -> dict:
         bandwidth_hz is not None,
     )
 
+    antenna_model = _normalize_antenna_model(
+        _get_str(params, "antenna_model", "gaussian")
+    )
+
     return {
-        "eirp_dbw":            _parse_eirp(params),
-        "rx_gain_dbi":         _get_float(params, "rx_gain_dbi", _get_float(params, "rx_gain", DEFAULT_RX_GAIN_DBI)),
-        "freq_hz":             freq_hz,
-        "antenna_model":       _get_str(params, "antenna_model", "gaussian").lower(),
-        "beamwidth_deg":       _get_float(params, "beamwidth_deg", _get_float(params, "beamwidth", 4.5), min_val=0.1),
-        "aperture_radius_wl":  aperture_radius_wl,
-        "aperture_radius_m":   aperture_radius_m,
-        "max_gain_dbi":        _get_float(params, "max_gain_dbi", 30.0, min_val=10.0, max_val=60.0),
-        "ln_db":               _get_float(params, "ln_db", -20.0),
-        "ellipticity_ratio":   _get_float(params, "ellipticity_ratio", 1.0, min_val=1.0, max_val=3.0),
-        "num_elements_x":      _get_int(params, "num_elements_x", 8, min_val=1, max_val=64),
-        "num_elements_y":      _get_int(params, "num_elements_y", 8, min_val=1, max_val=64),
-        "spacing_wl":          _get_float(params, "spacing_wl", 0.5, min_val=0.1, max_val=2.0),
-        "element_exponent":    _get_float(params, "element_exponent", 1.3, min_val=0.0, max_val=3.0),
-        "clutter_enable":      _parse_clutter_enable(params),
-        "clutter_values":      _parse_clutter_values(params),
-        "clutter_fallback":    _parse_clutter_fallback(params),
-        "atmospheric_mode":    _get_str(params, "atmospheric_mode", "disable").lower(),
-        "availability_percent": _get_float(params, "availability_percent", 99.0, min_val=90.0, max_val=99.999),
+        "eirp_dbw": _parse_eirp(params),
+        "rx_gain_dbi": _get_float(
+            params, "rx_gain_dbi", _get_float(params, "rx_gain", DEFAULT_RX_GAIN_DBI)
+        ),
+        "freq_hz": freq_hz,
+        "antenna_model": antenna_model,
+        "custom_antenna": _parse_custom_antenna_payload(params),
+        "beamwidth_deg": _get_float(
+            params, "beamwidth_deg", _get_float(params, "beamwidth", 4.5), min_val=0.1
+        ),
+        "aperture_radius_wl": aperture_radius_wl,
+        "aperture_radius_m": aperture_radius_m,
+        "max_gain_dbi": _get_float(
+            params, "max_gain_dbi", 30.0, min_val=10.0, max_val=60.0
+        ),
+        "ln_db": _get_float(params, "ln_db", -20.0),
+        "ellipticity_ratio": _get_float(
+            params, "ellipticity_ratio", 1.0, min_val=1.0, max_val=3.0
+        ),
+        "num_elements_x": _get_int(params, "num_elements_x", 8, min_val=1, max_val=64),
+        "num_elements_y": _get_int(params, "num_elements_y", 8, min_val=1, max_val=64),
+        "spacing_wl": _get_float(params, "spacing_wl", 0.5, min_val=0.1, max_val=2.0),
+        "element_exponent": _get_float(
+            params, "element_exponent", 1.3, min_val=0.0, max_val=3.0
+        ),
+        "clutter_enable": _parse_clutter_enable(params),
+        "clutter_values": _parse_clutter_values(params),
+        "clutter_fallback": _parse_clutter_fallback(params),
+        "atmospheric_mode": _get_str(params, "atmospheric_mode", "disable").lower(),
+        "availability_percent": _get_float(
+            params, "availability_percent", 99.0, min_val=90.0, max_val=99.999
+        ),
         "additional_losses_db": _get_float(
-            params, "additional_losses_db", 2.0, min_val=ADDITIONAL_LOSSES_DB_MIN, max_val=ADDITIONAL_LOSSES_DB_MAX
+            params,
+            "additional_losses_db",
+            2.0,
+            min_val=ADDITIONAL_LOSSES_DB_MIN,
+            max_val=ADDITIONAL_LOSSES_DB_MAX,
         ),
         "polarization_loss_db": _get_float(
-            params, "polarization_loss_db", 0.0, min_val=POLARIZATION_LOSS_DB_MIN, max_val=POLARIZATION_LOSS_DB_MAX
+            params,
+            "polarization_loss_db",
+            0.0,
+            min_val=POLARIZATION_LOSS_DB_MIN,
+            max_val=POLARIZATION_LOSS_DB_MAX,
         ),
         "system_noise_temp_k": system_noise_temp_k,
         "bandwidth_hz": bandwidth_hz,
