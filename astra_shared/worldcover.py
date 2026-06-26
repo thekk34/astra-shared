@@ -82,7 +82,9 @@ def _clutter_cache_eviction_loop() -> None:
     """Background daemon: evict stale entries when cache exceeds max size."""
     while True:
         time.sleep(_CACHE_EVICT_INTERVAL)
-        if len(_CLUTTER_CACHE) > _CACHE_MAX_SIZE:
+        with _CLUTTER_CACHE_LOCK:
+            over_limit = len(_CLUTTER_CACHE) > _CACHE_MAX_SIZE
+        if over_limit:
             _evict_clutter_cache()
 
 
@@ -113,7 +115,7 @@ _TILE_DOWNLOAD_LOCKS_LOCK = threading.Lock()
 # skipped across service restarts (previously 51 wasted probes per Japan run).
 _TILES_NOT_ON_S3: set[str] = set()
 _TILES_NOT_ON_S3_PATH = WORLDCOVER_DIR / "tiles_not_on_s3.json"
-_TILES_NOT_ON_S3_LOCK = threading.Lock()
+_TILES_NOT_ON_S3_LOCK = threading.RLock()
 
 
 def _load_tiles_not_on_s3() -> None:
@@ -130,11 +132,18 @@ def _load_tiles_not_on_s3() -> None:
 
 def _save_tiles_not_on_s3() -> None:
     try:
+        with _TILES_NOT_ON_S3_LOCK:
+            tiles = sorted(_TILES_NOT_ON_S3)
         tmp = _TILES_NOT_ON_S3_PATH.with_suffix(".tmp")
-        tmp.write_text(json.dumps(sorted(_TILES_NOT_ON_S3)))
+        tmp.write_text(json.dumps(tiles))
         tmp.replace(_TILES_NOT_ON_S3_PATH)
     except Exception as exc:
         logger.warning("Could not save tiles_not_on_s3 cache: %s", exc)
+
+
+def _is_tile_not_on_s3(tile_name: str) -> bool:
+    with _TILES_NOT_ON_S3_LOCK:
+        return tile_name in _TILES_NOT_ON_S3
 
 # Tiles confirmed present on local disk.  Once a tile is in this set, the hot
 # path in fetch_worldcover_class skips the 337K pathlib.exists() syscalls
@@ -155,6 +164,7 @@ def _mark_tile_known_local(tile_name: str) -> None:
 # Bboxes that have already been fully prefetched this process lifetime.
 # Prevents the 30 parallel worker threads from each triggering a redundant prefetch.
 _PREFETCHED_BBOXES: set[tuple[float, float, float, float]] = set()
+_PREFETCHING_BBOXES: set[tuple[float, float, float, float]] = set()
 _PREFETCHED_BBOXES_LOCK = threading.Lock()
 
 # Create WORLDCOVER_DIR once at import time (single-threaded) so no thread ever
@@ -163,18 +173,25 @@ _PREFETCHED_BBOXES_LOCK = threading.Lock()
 WORLDCOVER_DIR.mkdir(parents=True, exist_ok=True)
 _load_tiles_not_on_s3()
 
-# Persistent HTTPS session for S3 tile downloads.
-# Reusing one session across all downloads avoids per-connection TLS handshake
-# overhead (~0.5 s each): load_verify_locations + do_handshake + TCP connect
-# accounted for 42 s in a 213-tile download run.
-_S3_SESSION = requests.Session()
-_S3_ADAPTER = requests.adapters.HTTPAdapter(
-    pool_connections=4,
-    pool_maxsize=8,
-    max_retries=0,
-)
-_S3_SESSION.mount("https://", _S3_ADAPTER)
-_S3_SESSION.mount("http://", _S3_ADAPTER)
+# Persistent HTTPS sessions for S3 tile downloads, one per worker thread.
+# requests.Session is not guaranteed thread-safe, so each download thread gets
+# its own pooled session instead of sharing a single global Session.
+_S3_SESSION_LOCAL = threading.local()
+
+
+def _get_s3_session() -> requests.Session:
+    session = getattr(_S3_SESSION_LOCAL, "session", None)
+    if session is None:
+        session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=4,
+            pool_maxsize=8,
+            max_retries=0,
+        )
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        _S3_SESSION_LOCAL.session = session
+    return session
 
 def clear_clutter_cache() -> None:
     """Clear the clutter loss cache."""
@@ -382,7 +399,7 @@ def ensure_worldcover_tile(
     tile_name = get_tile_name(lat, lon)
 
     # Skip tiles confirmed absent on S3 (ocean tiles, tiles outside coverage area)
-    if tile_name in _TILES_NOT_ON_S3:
+    if _is_tile_not_on_s3(tile_name):
         return None
 
     tile_path = worldcover_dir / tile_name
@@ -401,7 +418,7 @@ def ensure_worldcover_tile(
     with tile_lock:
         # Re-check after acquiring lock — another thread may have downloaded it
         # or confirmed it absent while we were waiting.
-        if tile_name in _TILES_NOT_ON_S3:
+        if _is_tile_not_on_s3(tile_name):
             return None
         if tile_path.exists() and tile_path.stat().st_size > 0:
             _mark_tile_known_local(tile_name)
@@ -417,7 +434,7 @@ def ensure_worldcover_tile(
         start_time = time.time()
         try:
             # connect_timeout=30, read_timeout=60 per chunk
-            with _S3_SESSION.get(url, stream=True, timeout=(30, 60)) as r:
+            with _get_s3_session().get(url, stream=True, timeout=(30, 60)) as r:
                 if r.status_code == 404:
                     # Tile doesn't exist on S3 (ocean or outside coverage area).
                     # Record it so future calls skip the S3 round-trip entirely,
@@ -496,7 +513,7 @@ def fetch_worldcover_class(
     tile_path = worldcover_dir / tile_name
 
     if not _is_tile_known_local(tile_name):
-        if tile_name in _TILES_NOT_ON_S3:
+        if _is_tile_not_on_s3(tile_name):
             return None
         if tile_path.exists():
             _mark_tile_known_local(tile_name)
@@ -636,47 +653,57 @@ def prefetch_tiles_for_bbox(
         math.ceil(bbox[3] / 3) * 3,
     )
     with _PREFETCHED_BBOXES_LOCK:
-        if bbox_key in _PREFETCHED_BBOXES:
+        if bbox_key in _PREFETCHED_BBOXES or bbox_key in _PREFETCHING_BBOXES:
             return
-        _PREFETCHED_BBOXES.add(bbox_key)
+        _PREFETCHING_BBOXES.add(bbox_key)
 
-    already_local = sum(
-        1 for tlat, tlon in tile_points
-        if (worldcover_dir / get_tile_name(tlat, tlon)).exists()
-           or get_tile_name(tlat, tlon) in _TILES_NOT_ON_S3
-    )
-    to_download = len(tile_points) - already_local
+    prefetch_ok = False
+    try:
+        already_local = sum(
+            1 for tlat, tlon in tile_points
+            if (worldcover_dir / get_tile_name(tlat, tlon)).exists()
+               or _is_tile_not_on_s3(get_tile_name(tlat, tlon))
+        )
+        to_download = len(tile_points) - already_local
 
-    logger.info(
-        "WorldCover prefetch: %d tiles in bbox, %d already cached, %d to download "
-        "(%d workers)",
-        len(tile_points),
-        already_local,
-        to_download,
-        num_workers,
-    )
+        logger.info(
+            "WorldCover prefetch: %d tiles in bbox, %d already cached, %d to download "
+            "(%d workers)",
+            len(tile_points),
+            already_local,
+            to_download,
+            num_workers,
+        )
 
-    if to_download == 0:
-        return
+        if to_download == 0:
+            prefetch_ok = True
+            return
 
-    with ThreadPoolExecutor(
-        max_workers=num_workers, thread_name_prefix="wc-prefetch"
-    ) as pool:
-        futures = {
-            pool.submit(ensure_worldcover_tile, tlat, tlon, worldcover_dir, bbox=bbox): (tlat, tlon)
-            for tlat, tlon in tile_points
-        }
-        for future in as_completed(futures):
-            try:
-                future.result()
-            except Exception as exc:
-                tlat, tlon = futures[future]
-                logger.warning(
-                    "WorldCover tile prefetch failed at (%.1f, %.1f): %s",
-                    tlat,
-                    tlon,
-                    exc,
-                )
+        prefetch_ok = True
+        with ThreadPoolExecutor(
+            max_workers=num_workers, thread_name_prefix="wc-prefetch"
+        ) as pool:
+            futures = {
+                pool.submit(ensure_worldcover_tile, tlat, tlon, worldcover_dir, bbox=bbox): (tlat, tlon)
+                for tlat, tlon in tile_points
+            }
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception as exc:
+                    prefetch_ok = False
+                    tlat, tlon = futures[future]
+                    logger.warning(
+                        "WorldCover tile prefetch failed at (%.1f, %.1f): %s",
+                        tlat,
+                        tlon,
+                        exc,
+                    )
+    finally:
+        with _PREFETCHED_BBOXES_LOCK:
+            _PREFETCHING_BBOXES.discard(bbox_key)
+            if prefetch_ok:
+                _PREFETCHED_BBOXES.add(bbox_key)
 
 
 def load_country_boundary(
