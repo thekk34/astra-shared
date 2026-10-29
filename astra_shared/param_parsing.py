@@ -21,10 +21,17 @@ from .defaults import (
     POLARIZATION_LOSS_DB_MAX,
     POLARIZATION_LOSS_DB_MIN,
 )
+from .rf_schema import (
+    DEFAULT_OVERHEAD_PERCENT,
+    DEFAULT_SHANNON_ATTENUATION_FACTOR,
+    RfConfigError,
+    convert_rf_block,
+    parse_bool_value,
+)
 
 logger = logging.getLogger(__name__)
 
-MODULATIONS = {"BPSK", "QPSK", "OQPSK", "8PSK", "16QAM", "64QAM"}
+MODULATIONS = {"BPSK", "QPSK", "OQPSK", "8PSK", "16QAM", "64QAM", "256QAM"}
 VALID_CODE_RATES = (
     1.0 / 4.0,
     1.0 / 3.0,
@@ -202,49 +209,101 @@ def _normalize_antenna_model(value: str | None) -> str:
 def _parse_modulation(params: dict) -> str:
     modulation = str(params.get("modulation") or DEFAULT_MODULATION).strip().upper()
     if modulation not in MODULATIONS:
-        raise ValueError(f"Unsupported modulation: {modulation}")
+        raise RfConfigError(f"Unsupported modulation: {modulation}")
     return modulation
-
-
-def _parse_data_rate_bps(params: dict) -> float | None:
-    raw = params.get("data_rate_bps")
-    if raw in (None, "", "null"):
-        return None
-    value = float(raw)
-    if value <= 0.0:
-        raise ValueError("data_rate_bps must be greater than 0")
-    return value
 
 
 def _parse_code_rate(params: dict) -> float:
     raw = params.get("code_rate", DEFAULT_CODE_RATE)
     if raw in (None, "", "null"):
         return DEFAULT_CODE_RATE
-    value = float(raw)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise RfConfigError(f"code_rate must be one of: {VALID_CODE_RATE_LABELS}") from exc
     if not any(
         math.isclose(value, allowed, rel_tol=0.0, abs_tol=1.0e-9)
         for allowed in VALID_CODE_RATES
     ):
-        raise ValueError(f"code_rate must be one of: {VALID_CODE_RATE_LABELS}")
+        raise RfConfigError(f"code_rate must be one of: {VALID_CODE_RATE_LABELS}")
     return value
 
 
 def _parse_bool(params: dict, key: str, default: bool) -> bool:
+    return parse_bool_value(params.get(key, default), default)
+
+
+def _parse_mcs_selection(params: dict) -> str:
+    raw = params.get("mcs_selection", "fixed")
+    if raw in (None, ""):
+        return "fixed"
+    if raw not in ("fixed", "auto"):
+        raise RfConfigError("mcs_selection must be fixed or auto")
+    return raw
+
+
+def _parse_conditional_number(
+    params: dict,
+    key: str,
+    default: float,
+    *,
+    used: bool,
+    valid,
+    error: str,
+) -> float:
     raw = params.get(key, default)
     if raw in (None, ""):
-        return default
+        raw = default
     if isinstance(raw, bool):
-        return raw
-    if isinstance(raw, (int, float)):
-        return raw != 0
-    return str(raw).strip().lower() in ("true", "1", "yes", "on", "enable", "enabled")
+        if used:
+            raise RfConfigError(error)
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError, OverflowError):
+        if used:
+            raise RfConfigError(error)
+        return default
+    if not math.isfinite(value) or not valid(value):
+        if used:
+            raise RfConfigError(error)
+        # Hidden, unused values remain part of the saved project.  Preserve
+        # finite values so a Fixed/link-off replay does not rewrite them.
+        if math.isfinite(value):
+            return value
+        return default
+    return value
+
+
+def _resolve_bandwidth_hz(params: dict) -> float:
+    if params.get("bandwidth_mhz") not in (None, "", "null"):
+        key = "bandwidth_mhz"
+        multiplier = 1.0e6
+    elif params.get("bandwidth_hz") not in (None, "", "null"):
+        key = "bandwidth_hz"
+        multiplier = 1.0
+    else:
+        return float(DEFAULT_BANDWIDTH_HZ)
+    raw = params[key]
+    if isinstance(raw, bool):
+        raise RfConfigError(f"{key} must be a positive finite number")
+    try:
+        value = float(raw) * multiplier
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise RfConfigError(f"{key} must be a positive finite number") from exc
+    if not math.isfinite(value) or value <= 0:
+        raise RfConfigError(f"{key} must be a positive finite number")
+    return value
 
 
 def _parse_optional_float(params: dict, key: str) -> float | None:
     raw = params.get(key)
     if raw in (None, "", "null"):
         return None
-    value = float(raw)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{key} must be finite") from exc
     if not math.isfinite(value):
         raise ValueError(f"{key} must be finite")
     return value
@@ -350,6 +409,8 @@ def parse_rf_params(params: dict) -> dict:
     Accepts form args, config.json, project files, or HTTP request bodies.
     Callers use the subset they need � unused keys are harmless.
     """
+    params, _conversion = convert_rf_block(params)
+
     if params.get("frequency_ghz") not in (None, "") or params.get("frequency") not in (
         None,
         "",
@@ -384,28 +445,7 @@ def parse_rf_params(params: dict) -> dict:
         max_val=10000.0,
     )
 
-    bw_mhz_raw = params.get("bandwidth_mhz")
-    bw_hz_raw = params.get("bandwidth_hz")
-    bandwidth_hz = None
-    explicit_bw = False
-    if bw_mhz_raw not in (None, "", "null"):
-        explicit_bw = True
-        try:
-            bandwidth_hz = float(bw_mhz_raw) * 1e6
-        except (TypeError, ValueError):
-            bandwidth_hz = None
-    elif bw_hz_raw not in (None, "", "null"):
-        explicit_bw = True
-        try:
-            bandwidth_hz = float(bw_hz_raw)
-        except (TypeError, ValueError):
-            bandwidth_hz = None
-
-    if bandwidth_hz is not None and bandwidth_hz <= 0:
-        bandwidth_hz = None
-
-    if bandwidth_hz is None and not explicit_bw:
-        bandwidth_hz = DEFAULT_BANDWIDTH_HZ
+    bandwidth_hz = _resolve_bandwidth_hz(params)
 
     logger.debug(
         "[RF] noise_temp_k=%s bandwidth_hz=%s cn_enabled=%s",
@@ -418,8 +458,25 @@ def parse_rf_params(params: dict) -> dict:
         _get_str(params, "antenna_model", "gaussian")
     )
 
+    digital_link = _parse_bool(params, "digital_link", False)
+    mcs_selection = _parse_mcs_selection(params)
+    shannon_attenuation_factor = _parse_conditional_number(
+        params,
+        "shannon_attenuation_factor",
+        DEFAULT_SHANNON_ATTENUATION_FACTOR,
+        used=digital_link and mcs_selection == "auto",
+        valid=lambda value: 0 < value <= 1,
+        error="shannon_attenuation_factor must be in (0, 1]",
+    )
+    overhead_percent = _parse_conditional_number(
+        params,
+        "overhead_percent",
+        DEFAULT_OVERHEAD_PERCENT,
+        used=digital_link,
+        valid=lambda value: 0 <= value < 50,
+        error="overhead_percent must be in [0, 50)",
+    )
     modulation = _parse_modulation(params)
-    data_rate_bps = _parse_data_rate_bps(params)
     code_rate = _parse_code_rate(params)
     compute_pfd, pfd_limit_band, pfd_l0_dbw_m2, pfd_l25_dbw_m2, pfd_ref_bw_hz = (
         _parse_pfd_params(params)
@@ -482,9 +539,12 @@ def parse_rf_params(params: dict) -> dict:
         ),
         "system_noise_temp_k": system_noise_temp_k,
         "bandwidth_hz": bandwidth_hz,
+        "digital_link": digital_link,
+        "mcs_selection": mcs_selection,
         "modulation": modulation,
-        "data_rate_bps": data_rate_bps,
         "code_rate": code_rate,
+        "shannon_attenuation_factor": shannon_attenuation_factor,
+        "overhead_percent": overhead_percent,
         "compute_pfd": compute_pfd,
         "pfd_limit_band": pfd_limit_band,
         "pfd_ref_bw_hz": pfd_ref_bw_hz,
